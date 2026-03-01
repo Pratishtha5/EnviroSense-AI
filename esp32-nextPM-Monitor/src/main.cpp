@@ -1,349 +1,241 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ModbusMaster.h>
 #include <PubSubClient.h>
 #include "credentials.h"
 
 #define LED_PIN 2
-#define NEXTPM_RX_PIN 17     
-#define NEXTPM_TX_PIN 16    
+#define NEXTPM_RX_PIN 17
+#define NEXTPM_TX_PIN 16
 #define NEXTPM_BAUD 115200
+#define NEXTPM_MODBUS_SLAVE_ID 1
 
 const char* mqtt_topic = "esp32/sensor/data";
 const char* mqtt_client_id = "ESP32Client_";
-
-// NextPM Protocol Constants 
-#define NEXTPM_ADDRESS 0x81
-#define NEXTPM_CMD_PM10S 0x11      // 10-second average
-#define NEXTPM_CMD_PM60S 0x12      // 60-second average
-#define NEXTPM_CMD_PM900S 0x13     // 900-second average
-#define NEXTPM_CMD_TRH 0x14        // Temperature & humidity
-#define NEXTPM_CMD_STATE 0x16      // Sensor state readings
-#define NEXTPM_PM_FRAME_LENGTH 16  // PM response is 16 bytes
-#define NEXTPM_TRH_FRAME_LENGTH 8  // T/RH response is 8 bytes
-#define NEXTPM_STATE_FRAME_LENGTH 4 // State response: ADDR CMD STATE CHK
+const uint16_t MQTT_BUFFER_SIZE = 1024;
 
 const unsigned long SENSOR_POLL_INTERVAL_MS = 60000;
 const unsigned long MQTT_PUBLISH_INTERVAL_MS = 60000;
 
-// Struct for NextPM data
+#define REG_STATUS 0x13
+
+#define REG_START_PM1_60SEC_AVG_CNT 62
+#define REG_START_PM2_5_60SEC_AVG_CNT 64
+#define REG_START_PM10_60SEC_AVG_CNT 66
+
+#define REG_START_PM1_60SEC_AVG_MASS 68
+#define REG_START_PM2_5_60SEC_AVG_MASS 70
+#define REG_START_PM10_60SEC_AVG_MASS 72
+
+#define REG_START_02_05_QTY_10SEC_AVG 128
+#define REG_START_05_10_QTY_10SEC_AVG 130
+#define REG_START_10_25_QTY_10SEC_AVG 132
+#define REG_START_25_50_QTY_10SEC_AVG 134
+#define REG_START_50_100_QTY_10SEC_AVG 136
+
+#define REG_PM_HUMIDITY 106
+#define REG_PM_TEMPERATURE 107
+
 struct NextPmReading {
-  uint16_t pm1_0_pcs;    // pcs/L
-  uint16_t pm2_5_pcs;    // pcs/L
-  uint16_t pm10_pcs;     // pcs/L
-  uint16_t pm1_0_ugm3;   // μg/m³
-  uint16_t pm2_5_ugm3;   // μg/m³
-  uint16_t pm10_ugm3;    // μg/m³
+  uint16_t pm1_0_pcs;
+  uint16_t pm2_5_pcs;
+  uint16_t pm10_pcs;
+  uint16_t pm1_0_ugm3;
+  uint16_t pm2_5_ugm3;
+  uint16_t pm10_ugm3;
   uint8_t state;
   unsigned long lastUpdateMs;
   bool valid;
 };
 
-// Hardware Serial for NextPM
-HardwareSerial nextPmSerial(2);  // UART2
+HardwareSerial nextPmSerial(2);
+ModbusMaster nextPmModbus;
+
 NextPmReading latestReading = {0, 0, 0, 0, 0, 0, 0, 0, false};
+
 float latestTemperature = NAN;
 float latestHumidity = NAN;
+
+float pmCount60s_pm1_0 = NAN;
+float pmCount60s_pm2_5 = NAN;
+float pmCount60s_pm10 = NAN;
+float pmMass60s_pm1_0 = NAN;
+float pmMass60s_pm2_5 = NAN;
+float pmMass60s_pm10 = NAN;
+
+float bin_0_3_0_5 = NAN;
+float bin_0_5_1_0 = NAN;
+float bin_1_0_2_5 = NAN;
+float bin_2_5_5_0 = NAN;
+float bin_5_0_10_0 = NAN;
+
+uint16_t latestStatusCode = 0;
+
 bool trhValid = false;
-unsigned long lastModbusRequest = 0;
+bool binsValid = false;
+
+unsigned long lastSensorPoll = 0;
 unsigned long lastMsg = 0;
 
-// WiFi & MQTT
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Calculate NextPM checksum: 0x100 - ((sum of all bytes) % 256)
-uint8_t calculateNextPMChecksum(uint8_t cmd) {
-  uint16_t sum = NEXTPM_ADDRESS + cmd;
-  return (0x100 - (sum % 256)) & 0xFF;
-}
-
-void sendNextPMCommand(uint8_t cmd) {
-  uint8_t command[3];
-  command[0] = NEXTPM_ADDRESS;
-  command[1] = cmd;
-  command[2] = calculateNextPMChecksum(command[1]);
-  
-  nextPmSerial.write(command, 3);
-  Serial.print("NextPM command sent: 0x");
-  Serial.print(command[0], HEX);
-  Serial.print(" 0x");
-  Serial.print(command[1], HEX);
-  Serial.print(" 0x");
-  Serial.println(command[2], HEX);
-}
-
-// Parse NextPM PM frame response (16 bytes)
-// Format: 0x81 CMD STATE PM1_pcs(2) PM2.5_pcs(2) PM10_pcs(2) PM1_ugm3(2) PM2.5_ugm3(2) PM10_ugm3(2) CHECKSUM
-bool parseNextPMPmFrame(NextPmReading& output) {
-  if (nextPmSerial.available() < NEXTPM_PM_FRAME_LENGTH) {
+bool readU16Register(uint16_t reg, uint16_t& outValue) {
+  uint8_t result = nextPmModbus.readHoldingRegisters(reg, 1);
+  if (result != nextPmModbus.ku8MBSuccess) {
     return false;
   }
-  
-  // Look for frame start (0x81)
-  while (nextPmSerial.available() > 0) {
-    uint8_t byte = nextPmSerial.peek();
-    if (byte == NEXTPM_ADDRESS) {
-      break;
-    }
-    nextPmSerial.read();  // Skip garbage bytes
-  }
-  
-  if (nextPmSerial.available() < NEXTPM_PM_FRAME_LENGTH) {
-    return false;
-  }
-  
-  // Read 16-byte frame
-  uint8_t frame[16];
-  for (uint8_t i = 0; i < 16; i++) {
-    frame[i] = nextPmSerial.read();
-  }
-  
-  // Debug: Log frame
-  Serial.print("NextPM frame (16 bytes): ");
-  for (uint8_t i = 0; i < 16; i++) {
-    Serial.print("0x");
-    if (frame[i] < 16) Serial.print("0");
-    Serial.print(frame[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-  
-  // Validate frame structure
-  if (frame[0] != NEXTPM_ADDRESS) {
-    Serial.println("Invalid frame start");
-    return false;
-  }
-  
-  if (frame[1] != NEXTPM_CMD_PM10S && frame[1] != NEXTPM_CMD_PM60S && frame[1] != NEXTPM_CMD_PM900S) {
-    Serial.print("Invalid command ID: 0x");
-    Serial.println(frame[1], HEX);
-    return false;
-  }
-  
-  // Verify checksum
-  uint16_t sum = 0;
-  for (uint8_t i = 0; i < 15; i++) {
-    sum += frame[i];
-  }
-  uint8_t expectedChecksum = (0x100 - (sum % 256)) & 0xFF;
-  if (frame[15] != expectedChecksum) {
-    Serial.print("Checksum mismatch: got 0x");
-    Serial.print(frame[15], HEX);
-    Serial.print(" expected 0x");
-    Serial.println(expectedChecksum, HEX);
-    return false;
-  }
-  
-  // Extract state code (byte 2)
-  output.state = frame[2];
-  
-  // Extract PM values (big-endian 16-bit values)
-  // Bytes 3-4: PM1 pcs/L
-  output.pm1_0_pcs = ((uint16_t)frame[3] << 8) | frame[4];
-  
-  // Bytes 5-6: PM2.5 pcs/L
-  output.pm2_5_pcs = ((uint16_t)frame[5] << 8) | frame[6];
-  
-  // Bytes 7-8: PM10 pcs/L
-  output.pm10_pcs = ((uint16_t)frame[7] << 8) | frame[8];
-  
-  // Bytes 9-10: PM1 μg/m³ (divide by 10)
-  output.pm1_0_ugm3 = ((uint16_t)frame[9] << 8) | frame[10];
-  
-  // Bytes 11-12: PM2.5 μg/m³ (divide by 10)
-  output.pm2_5_ugm3 = ((uint16_t)frame[11] << 8) | frame[12];
-  
-  // Bytes 13-14: PM10 μg/m³ (divide by 10)
-  output.pm10_ugm3 = ((uint16_t)frame[13] << 8) | frame[14];
-  
-  output.lastUpdateMs = millis();
-  output.valid = true;
-  
+  outValue = nextPmModbus.getResponseBuffer(0);
   return true;
 }
 
-bool parseNextPMTrhFrame(float& temperature, float& humidity) {
-  if (nextPmSerial.available() < NEXTPM_TRH_FRAME_LENGTH) {
+bool readU16Div1000(uint16_t reg, float& outValue) {
+  uint16_t raw = 0;
+  if (!readU16Register(reg, raw)) {
     return false;
   }
-
-  while (nextPmSerial.available() > 0) {
-    uint8_t byte = nextPmSerial.peek();
-    if (byte == NEXTPM_ADDRESS) {
-      break;
-    }
-    nextPmSerial.read();
-  }
-
-  if (nextPmSerial.available() < NEXTPM_TRH_FRAME_LENGTH) {
-    return false;
-  }
-
-  uint8_t frame[8];
-  for (uint8_t i = 0; i < 8; i++) {
-    frame[i] = nextPmSerial.read();
-  }
-
-  if (frame[0] != NEXTPM_ADDRESS) {
-    return false;
-  }
-
-  if (frame[1] == NEXTPM_CMD_STATE) {
-    if (nextPmSerial.available() < (NEXTPM_STATE_FRAME_LENGTH - 1)) {
-      return false;
-    }
-
-    uint8_t stateFrame[4];
-    stateFrame[0] = frame[0];
-    stateFrame[1] = frame[1];
-    for (uint8_t i = 2; i < 4; i++) {
-      stateFrame[i] = nextPmSerial.read();
-    }
-
-    uint16_t stateSum = stateFrame[0] + stateFrame[1] + stateFrame[2];
-    uint8_t expectedStateChecksum = (0x100 - (stateSum % 256)) & 0xFF;
-    if (stateFrame[3] == expectedStateChecksum) {
-      latestReading.state = stateFrame[2];
-      Serial.print("NextPM state frame during T/RH read, state=0x");
-      Serial.println(latestReading.state, HEX);
-    }
-    return false;
-  }
-
-  if (frame[1] != NEXTPM_CMD_TRH) {
-    return false;
-  }
-
-  uint16_t sum = 0;
-  for (uint8_t i = 0; i < 7; i++) {
-    sum += frame[i];
-  }
-  uint8_t expectedChecksum = (0x100 - (sum % 256)) & 0xFF;
-  if (frame[7] != expectedChecksum) {
-    Serial.print("T/RH checksum mismatch: got 0x");
-    Serial.print(frame[7], HEX);
-    Serial.print(" expected 0x");
-    Serial.println(expectedChecksum, HEX);
-    return false;
-  }
-
-  uint16_t rawTemp = ((uint16_t)frame[3] << 8) | frame[4];
-  uint16_t rawHumidity = ((uint16_t)frame[5] << 8) | frame[6];
-
-  temperature = rawTemp / 100.0;
-  humidity = rawHumidity / 100.0;
+  outValue = raw / 1000.0f;
   return true;
 }
 
-bool waitForNextPMPmResponse(uint16_t timeoutMs) {
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    if (parseNextPMPmFrame(latestReading)) {
-      return true;
-    }
-    delay(2);
+bool readU16Div100(uint16_t reg, float& outValue) {
+  uint16_t raw = 0;
+  if (!readU16Register(reg, raw)) {
+    return false;
   }
-  return false;
+  outValue = raw / 100.0f;
+  return true;
 }
 
-bool waitForNextPMTrhResponse(uint16_t timeoutMs) {
-  float temperature = NAN;
-  float humidity = NAN;
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    if (parseNextPMTrhFrame(temperature, humidity)) {
-      latestTemperature = temperature;
-      latestHumidity = humidity;
-      trhValid = true;
-      return true;
-    }
-    delay(2);
+bool readAveragedPMFloat(uint16_t reg, float& outValue) {
+  uint8_t result = nextPmModbus.readHoldingRegisters(reg, 2);
+  if (result != nextPmModbus.ku8MBSuccess) {
+    return false;
   }
-  return false;
+
+  uint32_t hi = nextPmModbus.getResponseBuffer(0);
+  uint32_t lo = nextPmModbus.getResponseBuffer(1);
+  outValue = ((lo << 16) | hi) / 1000.0f;
+  return true;
+}
+
+bool pollSensorModbus() {
+  bool ok = true;
+
+  ok = ok && readU16Register(REG_STATUS, latestStatusCode);
+
+  ok = ok && readAveragedPMFloat(REG_START_PM1_60SEC_AVG_CNT, pmCount60s_pm1_0);
+  ok = ok && readAveragedPMFloat(REG_START_PM2_5_60SEC_AVG_CNT, pmCount60s_pm2_5);
+  ok = ok && readAveragedPMFloat(REG_START_PM10_60SEC_AVG_CNT, pmCount60s_pm10);
+  ok = ok && readAveragedPMFloat(REG_START_PM1_60SEC_AVG_MASS, pmMass60s_pm1_0);
+  ok = ok && readAveragedPMFloat(REG_START_PM2_5_60SEC_AVG_MASS, pmMass60s_pm2_5);
+  ok = ok && readAveragedPMFloat(REG_START_PM10_60SEC_AVG_MASS, pmMass60s_pm10);
+
+  ok = ok && readU16Div1000(REG_START_02_05_QTY_10SEC_AVG, bin_0_3_0_5);
+  ok = ok && readU16Div1000(REG_START_05_10_QTY_10SEC_AVG, bin_0_5_1_0);
+  ok = ok && readU16Div1000(REG_START_10_25_QTY_10SEC_AVG, bin_1_0_2_5);
+  ok = ok && readU16Div1000(REG_START_25_50_QTY_10SEC_AVG, bin_2_5_5_0);
+  ok = ok && readU16Div1000(REG_START_50_100_QTY_10SEC_AVG, bin_5_0_10_0);
+
+  ok = ok && readU16Div100(REG_PM_HUMIDITY, latestHumidity);
+  ok = ok && readU16Div100(REG_PM_TEMPERATURE, latestTemperature);
+
+  if (!ok) {
+    latestReading.valid = false;
+    trhValid = false;
+    binsValid = false;
+    return false;
+  }
+
+  trhValid = true;
+  binsValid = true;
+
+  latestReading.pm1_0_pcs = (uint16_t)roundf(pmCount60s_pm1_0);
+  latestReading.pm2_5_pcs = (uint16_t)roundf(pmCount60s_pm2_5);
+  latestReading.pm10_pcs = (uint16_t)roundf(pmCount60s_pm10);
+  latestReading.pm1_0_ugm3 = (uint16_t)roundf(pmMass60s_pm1_0 * 10.0f);
+  latestReading.pm2_5_ugm3 = (uint16_t)roundf(pmMass60s_pm2_5 * 10.0f);
+  latestReading.pm10_ugm3 = (uint16_t)roundf(pmMass60s_pm10 * 10.0f);
+  latestReading.state = (uint8_t)(latestStatusCode & 0xFF);
+  latestReading.lastUpdateMs = millis();
+  latestReading.valid = true;
+
+  return true;
 }
 
 void updateSensorReading() {
-  bool gotNewPm = false;
-  bool gotNewTrh = false;
-
-  // Poll PM + T/RH every 60 seconds
-  if (millis() - lastModbusRequest > SENSOR_POLL_INTERVAL_MS) {
-    sendNextPMCommand(NEXTPM_CMD_PM60S);
-    gotNewPm = waitForNextPMPmResponse(400);
-
-    sendNextPMCommand(NEXTPM_CMD_TRH);
-    gotNewTrh = waitForNextPMTrhResponse(250);
-
-    lastModbusRequest = millis();
+  if (millis() - lastSensorPoll <= SENSOR_POLL_INTERVAL_MS) {
+    return;
   }
 
-  if (gotNewPm || gotNewTrh) {
-    if (!latestReading.valid) {
-      Serial.println("NextPM poll completed, but PM frame is not valid yet");
-      return;
-    }
+  lastSensorPoll = millis();
 
-    Serial.print("NextPM updated | State: 0x");
-    Serial.print(latestReading.state, HEX);
-    Serial.print(" | PM1.0(pcs/L): ");
-    Serial.print(latestReading.pm1_0_pcs);
-    Serial.print(" | PM2.5(pcs/L): ");
-    Serial.print(latestReading.pm2_5_pcs);
-    Serial.print(" | PM10(pcs/L): ");
-    Serial.println(latestReading.pm10_pcs);
-    
-    Serial.print("  PM1.0(μg/m³): ");
-    Serial.print(latestReading.pm1_0_ugm3 / 10.0);
-    Serial.print(" | PM2.5(μg/m³): ");
-    Serial.print(latestReading.pm2_5_ugm3 / 10.0);
-    Serial.print(" | PM10(μg/m³): ");
-    Serial.println(latestReading.pm10_ugm3 / 10.0);
-
-    if (trhValid) {
-      Serial.print("  Temp(°C): ");
-      Serial.print(latestTemperature);
-      Serial.print(" | RH(%): ");
-      Serial.println(latestHumidity);
-    } else {
-      Serial.println("  Temp/RH not available yet");
-    }
+  if (!pollSensorModbus()) {
+    Serial.println("NextPM Modbus read failed for one or more registers");
+    return;
   }
+
+  Serial.print("NextPM Modbus updated | Status: 0x");
+  Serial.print(latestStatusCode, HEX);
+  Serial.print(" | PM60s μg/m³ [1.0,2.5,10]: ");
+  Serial.print(pmMass60s_pm1_0, 3);
+  Serial.print(", ");
+  Serial.print(pmMass60s_pm2_5, 3);
+  Serial.print(", ");
+  Serial.println(pmMass60s_pm10, 3);
+
+  Serial.print("  Bins pcs/ml [0.3-0.5,0.5-1,1-2.5,2.5-5,5-10]: ");
+  Serial.print(bin_0_3_0_5, 3);
+  Serial.print(", ");
+  Serial.print(bin_0_5_1_0, 3);
+  Serial.print(", ");
+  Serial.print(bin_1_0_2_5, 3);
+  Serial.print(", ");
+  Serial.print(bin_2_5_5_0, 3);
+  Serial.print(", ");
+  Serial.println(bin_5_0_10_0, 3);
 }
 
 String buildMqttPayload() {
   String payload = "{";
   payload += "\"sensor\":\"nextpm\"";
+
   payload += ",\"pm1_0_pcs\":";
   payload += latestReading.pm1_0_pcs;
   payload += ",\"pm2_5_pcs\":";
   payload += latestReading.pm2_5_pcs;
   payload += ",\"pm10_pcs\":";
   payload += latestReading.pm10_pcs;
+
   payload += ",\"pm1_0_ugm3\":";
-  payload += (latestReading.pm1_0_ugm3 / 10.0);
+  payload += (latestReading.pm1_0_ugm3 / 10.0f);
   payload += ",\"pm2_5_ugm3\":";
-  payload += (latestReading.pm2_5_ugm3 / 10.0);
+  payload += (latestReading.pm2_5_ugm3 / 10.0f);
   payload += ",\"pm10_ugm3\":";
-  payload += (latestReading.pm10_ugm3 / 10.0);
+  payload += (latestReading.pm10_ugm3 / 10.0f);
+
+  payload += ",\"bin_0_3_0_5\":";
+  payload += isnan(bin_0_3_0_5) ? "null" : String(bin_0_3_0_5);
+  payload += ",\"bin_0_5_1_0\":";
+  payload += isnan(bin_0_5_1_0) ? "null" : String(bin_0_5_1_0);
+  payload += ",\"bin_1_0_2_5\":";
+  payload += isnan(bin_1_0_2_5) ? "null" : String(bin_1_0_2_5);
+  payload += ",\"bin_2_5_5_0\":";
+  payload += isnan(bin_2_5_5_0) ? "null" : String(bin_2_5_5_0);
+  payload += ",\"bin_5_0_10_0\":";
+  payload += isnan(bin_5_0_10_0) ? "null" : String(bin_5_0_10_0);
+
+  payload += ",\"temperature\":";
+  payload += trhValid ? String(latestTemperature) : "null";
+  payload += ",\"humidity\":";
+  payload += trhValid ? String(latestHumidity) : "null";
+
   payload += ",\"state\":";
   payload += (int)latestReading.state;
   payload += ",\"valid\":";
   payload += latestReading.valid ? "true" : "false";
-  payload += ",\"temperature\":";
-  if (trhValid) {
-    payload += latestTemperature;
-  } else {
-    payload += "null";
-  }
-  payload += ",\"humidity\":";
-  if (trhValid) {
-    payload += latestHumidity;
-  } else {
-    payload += "null";
-  }
-  payload += ",\"uptime_ms\":";
-  payload += millis();
   payload += "}";
+
   return payload;
 }
 
@@ -362,20 +254,19 @@ void setup_wifi() {
 
   Serial.println();
   Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  Serial.println("IP address:");
   Serial.println(WiFi.localIP());
 }
 
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
-    
+
     String clientId = mqtt_client_id;
     clientId += String(random(0xffff), HEX);
-    
+
     if (client.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
       Serial.println("connected");
-      
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -390,16 +281,20 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Hello, ESP32!");
 
-  // NextPM requires: 115200 baud, 8 bits, EVEN parity, 1 stop bit
   nextPmSerial.begin(NEXTPM_BAUD, SERIAL_8E1, NEXTPM_RX_PIN, NEXTPM_TX_PIN);
-  Serial.print("NextPM UART ready on RX=");
+  nextPmModbus.begin(NEXTPM_MODBUS_SLAVE_ID, nextPmSerial);
+  Serial.print("NextPM Modbus ready on RX=");
   Serial.print(NEXTPM_RX_PIN);
   Serial.print(" TX=");
   Serial.println(NEXTPM_TX_PIN);
-  
+
   setup_wifi();
   client.setServer(MQTT_SERVER, MQTT_PORT);
-  
+  bool mqttBufferOk = client.setBufferSize(MQTT_BUFFER_SIZE);
+  Serial.print("MQTT buffer set to ");
+  Serial.print(MQTT_BUFFER_SIZE);
+  Serial.print(" bytes: ");
+  Serial.println(mqttBufferOk ? "OK" : "FAILED");
 }
 
 void loop() {
@@ -411,29 +306,41 @@ void loop() {
   client.loop();
 
   unsigned long now = millis();
-  if (now - lastMsg > MQTT_PUBLISH_INTERVAL_MS) {  
+  if (now - lastMsg > MQTT_PUBLISH_INTERVAL_MS) {
     lastMsg = now;
     if (!latestReading.valid) {
-      Serial.println("No valid NextPM frame yet; skipping MQTT publish");
+      Serial.println("No valid NextPM Modbus data yet; skipping MQTT publish");
       return;
     }
-    
+
     digitalWrite(LED_PIN, HIGH);
-    Serial.println("LED is ON");
-    
+
     String payload = buildMqttPayload();
-    
     Serial.print("Publishing message: ");
     Serial.println(payload);
-    
+
     if (client.publish(mqtt_topic, payload.c_str())) {
       Serial.println("Message published successfully");
     } else {
-      Serial.println("Message publish failed");
+      Serial.print("Message publish failed | connected=");
+      Serial.print(client.connected() ? "true" : "false");
+      Serial.print(" | state=");
+      Serial.print(client.state());
+      Serial.print(" | payload_len=");
+      Serial.println(payload.length());
+
+      if (!client.connected()) {
+        reconnect();
+      }
+
+      if (client.publish(mqtt_topic, payload.c_str())) {
+        Serial.println("Message publish retry successful");
+      } else {
+        Serial.println("Message publish retry failed");
+      }
     }
 
     delay(500);
     digitalWrite(LED_PIN, LOW);
-    Serial.println("LED is OFF");
   }
 }

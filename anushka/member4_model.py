@@ -81,4 +81,4 @@ def run_pipeline():
 
     print("✅ Inserted successfully!")
 
-    print("✅ Inserted successfully!")
+   

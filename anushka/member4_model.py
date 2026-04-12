@@ -64,7 +64,7 @@ def run_pipeline():
     with db_utils.get_engine().begin() as conn:
         row = result_df.iloc[0].to_dict()
         stmt = text("""
-            INSERT INTO anushka (
+            INSERT INTO anushka_features (
                 time, device_id, pm2_5, temperature, humidity,
                 pm2_5_lag1, pm2_5_roll_1h, created_by
             ) VALUES (

@@ -4,11 +4,9 @@ from member4_model import run_pipeline
 
 def main():
     while True:
-        try:
-            run_pipeline()
-            print("Pipeline executed successfully")
-        except Exception as e:
-            print("Error:", e)
+        
+        run_pipeline()
+            
 
         time.sleep(60)
 

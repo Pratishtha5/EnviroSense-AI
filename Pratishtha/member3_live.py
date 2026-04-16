@@ -21,7 +21,7 @@ import db_utils
 # HELPER
 def get_last_saved_time():
     with db_utils.get_engine().connect() as conn:
-        result = conn.execute(text("SELECT MAX(time) FROM member3_features_v2"))
+        result = conn.execute(text("SELECT MAX(time) FROM pratishtha_features"))
         return result.scalar()
 
 # SETUP

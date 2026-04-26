@@ -7,10 +7,13 @@ import {
   baseTooltip,
   splitLine,
 } from "@/lib/echarts-theme";
-import { timeline24h } from "@/lib/mock-data";
+import { useSensorData } from "@/lib/resilience";
 
 /** 24-hour timeline: PM2.5 (left axis) overlaid with Temp & Humidity (right axis) */
 export function Timeline24hChart({ height = 320 }: { height?: number }) {
+  const { snapshot } = useSensorData();
+  const data = snapshot.timeline24h;
+
   const option = {
     grid: { ...baseGrid, top: 36, right: 50 },
     legend: {
@@ -23,7 +26,7 @@ export function Timeline24hChart({ height = 320 }: { height?: number }) {
     tooltip: { trigger: "axis", ...baseTooltip },
     xAxis: {
       type: "category",
-      data: timeline24h.map((d) => `${String(d.hour).padStart(2, "0")}:00`),
+      data: data.map((d) => `${String(d.hour).padStart(2, "0")}:00`),
       axisLine,
       axisLabel: { ...baseTextStyle, interval: 2 },
     },
@@ -53,7 +56,7 @@ export function Timeline24hChart({ height = 320 }: { height?: number }) {
         type: "line",
         smooth: true,
         symbol: "none",
-        data: timeline24h.map((d) => d.pm25),
+        data: data.map((d) => d.pm25),
         lineStyle: { color: ENVIRO_COLORS.clean, width: 2.2 },
         areaStyle: {
           color: {
@@ -72,7 +75,7 @@ export function Timeline24hChart({ height = 320 }: { height?: number }) {
         smooth: true,
         symbol: "none",
         yAxisIndex: 1,
-        data: timeline24h.map((d) => d.temp),
+        data: data.map((d) => d.temp),
         lineStyle: { color: ENVIRO_COLORS.amber, width: 1.6, type: "dashed" },
       },
       {
@@ -81,7 +84,7 @@ export function Timeline24hChart({ height = 320 }: { height?: number }) {
         smooth: true,
         symbol: "none",
         yAxisIndex: 1,
-        data: timeline24h.map((d) => d.humidity),
+        data: data.map((d) => d.humidity),
         lineStyle: { color: ENVIRO_COLORS.violet, width: 1.6, type: "dashed" },
       },
     ],

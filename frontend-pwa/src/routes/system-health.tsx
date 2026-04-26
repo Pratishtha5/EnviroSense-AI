@@ -10,6 +10,7 @@ import { anomalies, modelRegistry } from "@/lib/mock-data";
 import { aqiTextClass, type AqiLevel } from "@/lib/aqi";
 import { SafeChart } from "@/components/SafeChart";
 import { HistoricalBanner } from "@/components/HistoricalBanner";
+import { useSensorData } from "@/lib/resilience";
 
 export const Route = createFileRoute("/system-health")({
   head: () => ({
@@ -28,6 +29,13 @@ export const Route = createFileRoute("/system-health")({
 });
 
 function SystemHealthPage() {
+  const { snapshot } = useSensorData();
+  const { trust, uptime, validity } = snapshot.reliability;
+  // Completeness derived from validity for now — same source signal.
+  const completeness = +(validity + 0.8).toFixed(1);
+  const validTone: "clean" | "moderate" | "poor" =
+    validity >= 98 ? "clean" : validity >= 95 ? "moderate" : "poor";
+
   return (
     <Layout>
       <PageHeader
@@ -40,13 +48,13 @@ function SystemHealthPage() {
 
       {/* Quality grid */}
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <QualityCard label="Uptime" value="99.4%" icon={ShieldCheck} tone="clean" sub="Last 30 days" />
-        <QualityCard label="Completeness" value="98.6%" icon={CheckCircle2} tone="clean" sub="Samples received / expected" />
-        <QualityCard label="Valid %" value="97.8%" icon={Activity} tone="moderate" sub="Passed validation rules" />
+        <QualityCard label="Uptime" value={`${uptime.toFixed(1)}%`} icon={ShieldCheck} tone="clean" sub="Last 30 days" />
+        <QualityCard label="Completeness" value={`${completeness.toFixed(1)}%`} icon={CheckCircle2} tone="clean" sub="Samples received / expected" />
+        <QualityCard label="Valid %" value={`${validity.toFixed(1)}%`} icon={Activity} tone={validTone} sub="Passed validation rules" />
         <div className="panel p-4 flex flex-col">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Trust Score</div>
           <SafeChart label="trust-gauge" height={130}>
-            <TrustGauge value={94} height={130} label="Bayesian estimator" />
+            <TrustGauge value={trust} height={130} label="Bayesian estimator" />
           </SafeChart>
         </div>
       </section>

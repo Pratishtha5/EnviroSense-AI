@@ -10,6 +10,7 @@ import { Timeline24hChart } from "@/components/charts/Timeline24hChart";
 import { SafeChart } from "@/components/SafeChart";
 import { HistoricalBanner } from "@/components/HistoricalBanner";
 import { GenerateReportButton, ReportDrawer } from "@/components/ReportDrawer";
+import { useSensorData } from "@/lib/resilience";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -29,12 +30,15 @@ export const Route = createFileRoute("/")({
 
 function OverviewPage() {
   const [reportOpen, setReportOpen] = useState(false);
+  const { snapshot } = useSensorData();
+  const description = `Real-time air-quality readings and AI pipeline outputs for ${snapshot.sensor.device_label}.`;
+
   return (
     <Layout>
       <PageHeader
         eyebrow="Operational Layer"
         title="Overview"
-        description="Real-time air-quality readings and AI pipeline outputs for My Terrace-on-Room."
+        description={description}
         actions={<GenerateReportButton onClick={() => setReportOpen(true)} />}
       />
 
@@ -47,7 +51,11 @@ function OverviewPage() {
           <LiveStatusCard />
         </div>
         <ReliabilityCard />
-        <RegimeCard regime="Stable Indoor" />
+        <RegimeCard
+          regime={snapshot.regime}
+          transitions={snapshot.transitions}
+          stability={snapshot.stability}
+        />
       </div>
 
       {/* Middle row: timeline + anomaly */}
@@ -68,7 +76,7 @@ function OverviewPage() {
             </SafeChart>
           </div>
         </section>
-        <AnomalyStatusCard anomalous severity="critical" detectedAt="14:32:11" />
+        <AnomalyStatusCard state={snapshot.anomaly} />
       </div>
     </Layout>
   );

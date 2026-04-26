@@ -8,7 +8,7 @@ import { SafeChart } from "@/components/SafeChart";
 /** Hero "Live Status" card with PM2.5 / PM10, sparkline, and city comparison */
 export function LiveStatusCard() {
   const { snapshot, isLive, lastSyncTs } = useSensorData();
-  const { pm25, pm10, cityAvg, delta, sparkline } = snapshot;
+  const { pm25, pm10, cityAvg, delta, sparkline, device_label } = snapshot.sensor;
 
   const level25 = classifyPM(pm25);
   const level10 = classifyPM(pm10);
@@ -25,7 +25,7 @@ export function LiveStatusCard() {
       <div className="relative flex items-start justify-between gap-3">
         <div>
           <div className="text-[10px] uppercase tracking-[0.22em] text-muted-foreground">Live Status</div>
-          <div className="mt-0.5 text-sm font-medium">My Terrace-on-Room</div>
+          <div className="mt-0.5 text-sm font-medium">{device_label}</div>
         </div>
         <div className="text-right">
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground">

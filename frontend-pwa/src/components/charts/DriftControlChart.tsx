@@ -7,10 +7,12 @@ import {
   ENVIRO_COLORS,
   splitLine,
 } from "@/lib/echarts-theme";
-import { driftSeries } from "@/lib/mock-data";
+import { useSensorData } from "@/lib/resilience";
 
 /** Z-score control chart with ±2σ control limits */
 export function DriftControlChart({ height = 280 }: { height?: number }) {
+  const { snapshot } = useSensorData();
+  const driftSeries = snapshot.drift;
   const option = {
     grid: { ...baseGrid, top: 32 },
     tooltip: {

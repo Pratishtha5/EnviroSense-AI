@@ -15,11 +15,9 @@ export function Footer() {
         <div className="flex flex-wrap items-center gap-3">
           <div className="inline-flex items-center gap-2 rounded-full border border-border bg-panel px-3 py-1.5 text-xs">
             <Users className="h-3.5 w-3.5 text-cyan" />
-            <span>5-Member Engineering Approach</span>
           </div>
           <div className="inline-flex items-center gap-2 rounded-full border border-clean/40 bg-clean/10 px-3 py-1.5 text-xs text-clean">
             <ShieldCheck className="h-3.5 w-3.5" />
-            <span>Code Approved by Codeowners</span>
           </div>
         </div>
       </div>

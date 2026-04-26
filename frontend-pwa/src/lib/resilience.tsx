@@ -8,79 +8,53 @@ import {
   type ReactNode,
 } from "react";
 import {
-  sparkline60,
-  timeline24h,
-  detailedForecast,
-  forecastData,
-  driftSeries,
-  modelMetrics,
-  initialAlerts,
-  type AppAlert,
-} from "@/lib/mock-data";
+  DEFAULT_DEVICE_ID,
+  DEVICES,
+  runPipeline,
+  type DeviceMeta,
+  type PipelineSnapshot,
+} from "@/lib/pipeline";
 
 /**
- * The "snapshot" represents the last successful payload from the FastAPI backend.
- * Everything the dashboard renders downstream of the polling layer reads from here.
+ * The "snapshot" is the full pipeline output for the active device.
+ * Everything the dashboard renders downstream of the polling layer reads
+ * from here — no component imports raw mocks for live data anymore.
+ *
+ *   sensor_data   → snapshot.sensor
+ *   regime_profiles    → snapshot.regime
+ *   regime_transitions → snapshot.transitions
+ *   regime_stability   → snapshot.stability
  */
-export interface SensorSnapshot {
-  ts: number;
-  pm25: number;
-  pm10: number;
-  cityAvg: number;
-  delta: number;
-  sparkline: number[];
-  timeline24h: typeof timeline24h;
-  forecast: typeof forecastData;
-  detailedForecast: typeof detailedForecast;
-  drift: typeof driftSeries;
-  modelMetrics: typeof modelMetrics;
-  alerts: AppAlert[];
-  regimeConfidence: number;
-}
+export type SensorSnapshot = PipelineSnapshot;
 
-const STORAGE_KEY = "envirosense.snapshot.v1";
+const STORAGE_KEY_PREFIX = "envirosense.snapshot.v2";
+const DEVICE_KEY = "envirosense.device.v1";
 const POLL_INTERVAL_MS = 60_000;
 const FETCH_TIMEOUT_MS = 4_000;
 
-/** Build a fresh deterministic snapshot from the in-memory mocks. */
-function buildSnapshot(tickSeed: number): SensorSnapshot {
-  const r = (n: number) => (Math.sin(tickSeed * 997 + n * 13) + 1) / 2;
-  const pm25 = +(8 + r(1) * 38).toFixed(1);
-  const pm10 = +(pm25 + 6 + r(2) * 20).toFixed(1);
-  const cityAvg = +(14 + r(3) * 26).toFixed(1);
-  const delta = +(r(4) * 4 - 2).toFixed(1);
-  return {
-    ts: Date.now(),
-    pm25,
-    pm10,
-    cityAvg,
-    delta,
-    sparkline: sparkline60,
-    timeline24h,
-    forecast: forecastData,
-    detailedForecast,
-    drift: driftSeries,
-    modelMetrics,
-    alerts: initialAlerts,
-    regimeConfidence: +(0.7 + r(5) * 0.25).toFixed(2),
-  };
+function storageKeyFor(deviceId: string) {
+  return `${STORAGE_KEY_PREFIX}.${deviceId}`;
 }
 
 /**
  * Simulated micro-batch fetch. In production this would hit FastAPI; here it
- * resolves with a fresh snapshot OR rejects when the developer toggle is set.
+ * resolves with the deterministic pipeline output for the active device OR
+ * rejects when the developer outage toggle is set.
  */
-function simulateFetch(tick: number, forceFail: boolean): Promise<SensorSnapshot> {
+function simulateFetch(
+  deviceId: string,
+  tick: number,
+  forceFail: boolean,
+): Promise<SensorSnapshot> {
   return new Promise((resolve, reject) => {
     const latency = 180 + Math.random() * 220;
     const timer = setTimeout(() => {
       if (forceFail) {
         reject(new Error("Simulated server outage (FastAPI unreachable)"));
       } else {
-        resolve(buildSnapshot(tick));
+        resolve(runPipeline(deviceId, tick));
       }
     }, latency);
-    // Honour timeout
     setTimeout(() => {
       clearTimeout(timer);
       reject(new Error("Request timed out"));
@@ -88,14 +62,22 @@ function simulateFetch(tick: number, forceFail: boolean): Promise<SensorSnapshot
   });
 }
 
-function readCache(): SensorSnapshot | null {
+function readCache(deviceId: string): SensorSnapshot | null {
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(storageKeyFor(deviceId));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as SensorSnapshot;
-    // Minimal shape check
-    if (typeof parsed?.ts !== "number" || !Array.isArray(parsed?.sparkline)) return null;
+    // Minimal shape validation — keeps the UI safe from corrupted cache.
+    if (
+      typeof parsed?.sensor?.ts !== "number" ||
+      !Array.isArray(parsed?.sensor?.sparkline) ||
+      !parsed?.regime ||
+      !parsed?.transitions ||
+      !parsed?.stability
+    ) {
+      return null;
+    }
     return parsed;
   } catch {
     return null;
@@ -105,10 +87,24 @@ function readCache(): SensorSnapshot | null {
 function writeCache(snap: SensorSnapshot) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snap));
+    window.localStorage.setItem(
+      storageKeyFor(snap.device.id),
+      JSON.stringify(snap),
+    );
   } catch {
     /* quota or private mode — silently ignore */
   }
+}
+
+function readStoredDeviceId(): string {
+  if (typeof window === "undefined") return DEFAULT_DEVICE_ID;
+  try {
+    const raw = window.localStorage.getItem(DEVICE_KEY);
+    if (raw && DEVICES.some((d) => d.id === raw)) return raw;
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_DEVICE_ID;
 }
 
 interface ResilienceContextValue {
@@ -118,6 +114,10 @@ interface ResilienceContextValue {
   failureReason: string | null;
   outageSimulated: boolean;
   setOutageSimulated: (v: boolean) => void;
+  /** Multi-device support — UI can switch active sensor without re-mount. */
+  deviceId: string;
+  devices: DeviceMeta[];
+  setDeviceId: (id: string) => void;
   /** Force a refetch immediately. */
   refresh: () => void;
 }
@@ -125,9 +125,11 @@ interface ResilienceContextValue {
 const ResilienceContext = createContext<ResilienceContextValue | null>(null);
 
 export function ResilienceProvider({ children }: { children: ReactNode }) {
-  // Bootstrap from cache (client) or seed snapshot (SSR-safe)
-  const seed = buildSnapshot(0);
-  const [snapshot, setSnapshot] = useState<SensorSnapshot>(seed);
+  // Bootstrap snapshot from a deterministic seed (SSR-safe).
+  const [deviceId, setDeviceIdState] = useState<string>(DEFAULT_DEVICE_ID);
+  const [snapshot, setSnapshot] = useState<SensorSnapshot>(() =>
+    runPipeline(DEFAULT_DEVICE_ID, 0),
+  );
   const [isLive, setIsLive] = useState(true);
   const [lastSyncTs, setLastSyncTs] = useState<number | null>(null);
   const [failureReason, setFailureReason] = useState<string | null>(null);
@@ -136,45 +138,68 @@ export function ResilienceProvider({ children }: { children: ReactNode }) {
   const outageRef = useRef(false);
   outageRef.current = outageSimulated;
 
-  // Hydrate from localStorage after mount
+  // Hydrate device + cache after mount (avoids SSR mismatch).
   useEffect(() => {
-    const cached = readCache();
+    const stored = readStoredDeviceId();
+    if (stored !== deviceId) setDeviceIdState(stored);
+    const cached = readCache(stored);
     if (cached) {
       setSnapshot(cached);
-      setLastSyncTs(cached.ts);
+      setLastSyncTs(cached.sensor.ts);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const doFetch = useCallback(async () => {
-    tickRef.current += 1;
-    try {
-      const next = await simulateFetch(tickRef.current, outageRef.current);
-      setSnapshot(next);
-      setIsLive(true);
-      setLastSyncTs(next.ts);
-      setFailureReason(null);
-      writeCache(next);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : "Unknown fetch error";
-      setFailureReason(reason);
-      setIsLive(false);
-      // Fall back to cached snapshot if we somehow lost it; otherwise keep last good snapshot.
-      const cached = readCache();
-      if (cached) setSnapshot(cached);
-    }
-  }, []);
+  const doFetch = useCallback(
+    async (targetDeviceId: string) => {
+      tickRef.current += 1;
+      try {
+        const next = await simulateFetch(
+          targetDeviceId,
+          tickRef.current,
+          outageRef.current,
+        );
+        setSnapshot(next);
+        setIsLive(true);
+        setLastSyncTs(next.sensor.ts);
+        setFailureReason(null);
+        writeCache(next);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "Unknown fetch error";
+        setFailureReason(reason);
+        setIsLive(false);
+        // Keep last-known snapshot on screen — graceful degradation.
+        const cached = readCache(targetDeviceId);
+        if (cached) setSnapshot(cached);
+      }
+    },
+    [],
+  );
 
-  // Initial fetch + 60s polling loop
+  // Initial fetch + 60s polling loop, restarts when active device changes.
   useEffect(() => {
-    doFetch();
-    const id = setInterval(doFetch, POLL_INTERVAL_MS);
+    doFetch(deviceId);
+    const id = setInterval(() => doFetch(deviceId), POLL_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [doFetch]);
+  }, [deviceId, doFetch]);
 
-  // When the dev toggle flips, immediately revalidate so the UI reacts without waiting 60s.
+  // When the dev outage toggle flips, immediately revalidate.
   useEffect(() => {
-    doFetch();
-  }, [outageSimulated, doFetch]);
+    doFetch(deviceId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outageSimulated]);
+
+  const setDeviceId = useCallback((id: string) => {
+    if (!DEVICES.some((d) => d.id === id)) return;
+    setDeviceIdState(id);
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(DEVICE_KEY, id);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, []);
 
   return (
     <ResilienceContext.Provider
@@ -185,7 +210,10 @@ export function ResilienceProvider({ children }: { children: ReactNode }) {
         failureReason,
         outageSimulated,
         setOutageSimulated,
-        refresh: doFetch,
+        deviceId,
+        devices: DEVICES,
+        setDeviceId,
+        refresh: () => doFetch(deviceId),
       }}
     >
       {children}
@@ -199,12 +227,15 @@ export function useSensorData() {
     // Provider not mounted (e.g. tests, SSR shell) — return a static snapshot
     // so consumers never crash. This is part of "graceful degradation".
     return {
-      snapshot: buildSnapshot(0),
+      snapshot: runPipeline(DEFAULT_DEVICE_ID, 0),
       isLive: true,
       lastSyncTs: null,
       failureReason: null,
       outageSimulated: false,
       setOutageSimulated: () => {},
+      deviceId: DEFAULT_DEVICE_ID,
+      devices: DEVICES,
+      setDeviceId: () => {},
       refresh: () => {},
     } satisfies ResilienceContextValue;
   }

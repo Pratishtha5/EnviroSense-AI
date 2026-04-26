@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, BellRing, Check, CheckCircle2, Info, Lightbulb, Sparkles, ShieldAlert, X } from "lucide-react";
 import { Layout } from "@/components/Layout";
 import { PageHeader } from "@/components/PageHeader";
-import { initialAlerts, type AlertSeverity, type AlertStatus, type AppAlert } from "@/lib/mock-data";
+import type { AlertSeverity, AlertStatus, AppAlert } from "@/lib/mock-data";
 import { useSensorData } from "@/lib/resilience";
 import { HistoricalBanner } from "@/components/HistoricalBanner";
 
@@ -27,12 +27,21 @@ const SEVERITIES: Array<AlertSeverity | "all"> = ["all", "critical", "warning", 
 const STATUSES: Array<AlertStatus | "all"> = ["all", "open", "acknowledged", "resolved"];
 
 function AlertsPage() {
-  const { isLive } = useSensorData();
-  const [alerts, setAlerts] = useState<AppAlert[]>(initialAlerts);
+  const { isLive, snapshot } = useSensorData();
+  // Seed alert list from the live pipeline snapshot. Local state is then used
+  // for user-driven lifecycle changes (acknowledge / resolve) so we do not
+  // overwrite their actions when the snapshot refreshes.
+  const [alerts, setAlerts] = useState<AppAlert[]>(snapshot.alerts);
   const [sev, setSev] = useState<AlertSeverity | "all">("all");
   const [status, setStatus] = useState<AlertStatus | "all">("all");
+
+  // First open critical alert powers the toast — no longer hardcoded.
+  const firstCritical = useMemo(
+    () => snapshot.alerts.find((a) => a.severity === "critical" && a.status !== "resolved"),
+    [snapshot.alerts],
+  );
   const [toast, setToast] = useState<string | null>(
-    "New critical alert: Sudden PM2.5 Anomaly · ANM-204",
+    firstCritical ? `New critical alert: ${firstCritical.title} · ${firstCritical.id}` : null,
   );
 
   useEffect(() => {

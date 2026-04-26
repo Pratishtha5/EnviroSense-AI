@@ -7,9 +7,11 @@ import {
   ENVIRO_COLORS,
   splitLine,
 } from "@/lib/echarts-theme";
-import { modelMetrics } from "@/lib/mock-data";
+import { useSensorData } from "@/lib/resilience";
 
 export function ModelMetricsChart({ height = 220 }: { height?: number }) {
+  const { snapshot } = useSensorData();
+  const modelMetrics = snapshot.modelMetrics;
   const option = {
     grid: { ...baseGrid, top: 32 },
     tooltip: { trigger: "axis", ...baseTooltip },

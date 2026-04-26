@@ -10,10 +10,10 @@ import { DensityScatterChart } from "@/components/charts/DensityScatterChart";
 import { CorrelationScatter } from "@/components/charts/CorrelationScatter";
 import { DiurnalHeatmapChart } from "@/components/charts/DiurnalHeatmapChart";
 import { sizeBins, sizeScenarios, densityScatter } from "@/lib/mock-data";
-import type { Regime } from "@/lib/mock-data";
 import { SafeChart } from "@/components/SafeChart";
 import { HistoricalBanner } from "@/components/HistoricalBanner";
 import { GenerateReportButton, ReportDrawer } from "@/components/ReportDrawer";
+import { useSensorData } from "@/lib/resilience";
 
 export const Route = createFileRoute("/predictive")({
   head: () => ({
@@ -35,12 +35,13 @@ const SCENARIOS = ["Normal", "Dust Storm", "Rain", "Post-Rain Clean Air"] as con
 const TABS = ["Forecast", "Particle Physics", "Correlations", "Diurnal"] as const;
 
 function PredictivePage() {
+  const { snapshot } = useSensorData();
   const [tab, setTab] = useState<(typeof TABS)[number]>("Forecast");
   const [scenario, setScenario] = useState<keyof typeof sizeScenarios>("Normal");
   const [axis, setAxis] = useState<"humidity" | "temp">("humidity");
   const [metric, setMetric] = useState<"pm25" | "pm10">("pm25");
   const [reportOpen, setReportOpen] = useState(false);
-  const currentRegime: Regime = "Stable Indoor";
+  const currentRegime = snapshot.regime.current;
 
   return (
     <Layout>

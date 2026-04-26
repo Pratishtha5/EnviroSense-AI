@@ -7,7 +7,7 @@ import {
   baseTooltip,
   splitLine,
 } from "@/lib/echarts-theme";
-import { detailedForecast } from "@/lib/mock-data";
+import { useSensorData } from "@/lib/resilience";
 
 /**
  * Detailed forecast chart used on Predictive Intelligence:
@@ -17,7 +17,8 @@ import { detailedForecast } from "@/lib/mock-data";
  *  - Shaded confidence band around the forecast
  */
 export function ForecastChart({ height = 360 }: { height?: number }) {
-  const { history, forecast } = detailedForecast;
+  const { snapshot } = useSensorData();
+  const { history, forecast } = snapshot.detailedForecast;
 
   const xData = [
     ...history.map((p) => p.t.toString()),

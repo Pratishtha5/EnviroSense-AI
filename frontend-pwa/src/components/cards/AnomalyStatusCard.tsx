@@ -1,14 +1,9 @@
 import { AlertTriangle, CheckCircle2 } from "lucide-react";
+import type { AnomalyState } from "@/lib/pipeline";
 
-export function AnomalyStatusCard({
-  anomalous = true,
-  severity = "critical",
-  detectedAt = "14:32:11",
-}: {
-  anomalous?: boolean;
-  severity?: "info" | "warning" | "critical";
-  detectedAt?: string;
-}) {
+export function AnomalyStatusCard({ state }: { state: AnomalyState }) {
+  const { anomalous, severity, detectedAt, code, title } = state;
+
   if (!anomalous) {
     return (
       <section className="panel panel-glow-clean p-5 h-full">
@@ -41,7 +36,7 @@ export function AnomalyStatusCard({
       <div className="mt-3 flex items-start gap-3">
         <AlertTriangle className={`h-8 w-8 shrink-0 ${c.text} ${c.glow}`} />
         <div className="min-w-0">
-          <div className={`text-base font-semibold ${c.text}`}>Sudden Spike Detected</div>
+          <div className={`text-base font-semibold ${c.text}`}>{title}</div>
           <div className="text-xs text-muted-foreground">
             Isolation Forest · class:{" "}
             <span className={`font-mono ${c.text}`}>{severity.toUpperCase()}</span> · 3.4σ deviation
@@ -50,7 +45,7 @@ export function AnomalyStatusCard({
       </div>
       <div className="mt-4 flex items-center justify-between text-[11px] text-muted-foreground border-t border-border pt-3">
         <span>Detected at <span className="font-mono text-foreground">{detectedAt}</span></span>
-        <span>Code <span className="font-mono text-foreground">ANM-204</span></span>
+        <span>Code <span className="font-mono text-foreground">{code}</span></span>
       </div>
     </section>
   );

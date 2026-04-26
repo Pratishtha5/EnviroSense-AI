@@ -1,43 +1,39 @@
 import sys
-import pandas as pd
 from pathlib import Path
+import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from sqlalchemy import text
 from dotenv import load_dotenv
+
 load_dotenv()
 
+# shared utils
 SHARED_UTILS_DIR = Path('/home/shared/envirosense')
-if str(SHARED_UTILS_DIR) not in sys.path:
-    sys.path.insert(0, str(SHARED_UTILS_DIR))
+sys.path.insert(0, str(SHARED_UTILS_DIR))
 
-import db_utils   
+import db_utils
 
+print("Running Member3 Backfill...")
 
-with db_utils.get_engine().connect() as conn:
-    result = conn.execute(text("SELECT MIN(time) FROM pratishtha_features"))
-    min_time = result.scalar()
-
-print(f"Earliest existing time: {min_time}")
-
-
-query =text("""
+# =========================
+# LOAD ALL SENSOR DATA
+# =========================
+query = """
 SELECT *
 FROM sensor_data
-WHERE time < :min_time
 ORDER BY time
-""")
+"""
 
 with db_utils.get_engine().connect() as conn:
-    df = pd.read_sql(query, conn, params={"min_time": min_time})
-
-print(f"Loaded {len(df)} rows for backfill")
+    df = pd.read_sql(query, conn)
 
 if df.empty:
-    print("No older data to backfill ")
+    print("No data found")
     exit()
 
-
+# =========================
+# PREPROCESS
+# =========================
 df['time'] = pd.to_datetime(df['time'], utc=True)
 
 bins = [
@@ -48,55 +44,57 @@ bins = [
     'bin_5_0_10_0'
 ]
 
+features = bins + ['pm2_5', 'pm10_0', 'temperature', 'humidity']
 
-X = df[bins + ['pm2_5', 'pm10_0', 'temperature', 'humidity']].fillna(0)
+X = df[features].fillna(0)
 X_scaled = StandardScaler().fit_transform(X)
 
-kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+# =========================
+# CLUSTERING (FULL DATA)
+# =========================
+kmeans = KMeans(n_clusters=3, random_state=42, n_init=20)
 df['cluster'] = kmeans.fit_predict(X_scaled)
 
-
-cluster_means = df.groupby('cluster')[['pm2_5', 'temperature', 'humidity']].mean()
-sorted_clusters = cluster_means.sort_values(by='pm2_5')
+# =========================
+# LABELING
+# =========================
+cluster_means = df.groupby('cluster')['pm2_5'].mean().sort_values()
 
 labels_map = {}
-
-for i, c in enumerate(sorted_clusters.index):
-    pm = sorted_clusters.loc[c, 'pm2_5']
-    temp = sorted_clusters.loc[c, 'temperature']
-    hum = sorted_clusters.loc[c, 'humidity']
-
+for i, c in enumerate(cluster_means.index):
     if i == 0:
-        if temp > 35:
-            labels_map[c] = "Warm but Cleaner Air"
-        elif hum > 70:
-            labels_map[c] = "Humid but Cleaner Air"
-        else:
-            labels_map[c] = "Better Air"
-
+        labels_map[c] = "Better Air"
     elif i == 1:
         labels_map[c] = "Moderate Pollution"
-
     else:
-        if temp > 35:
-            labels_map[c] = "Hot & Polluted"
-        else:
-            labels_map[c] = "Unhealthy Air"
+        labels_map[c] = "Unhealthy Air"
 
 df['label'] = df['cluster'].map(labels_map)
 
+# =========================
+# PREPARE OUTPUT
+# =========================
+out = df[['time', 'device_id', 'cluster', 'label']]
 
-features_df = df[['time', 'device_id', 'cluster', 'label']].copy()
-features_df.drop_duplicates(subset=['time', 'device_id'], inplace=True)
+# =========================
+# REMOVE DUPLICATES
+# =========================
+with db_utils.get_engine().connect() as conn:
+    existing = pd.read_sql("SELECT time, device_id FROM pratishtha_features", conn)
 
+if not existing.empty:
+    existing['time'] = pd.to_datetime(existing['time'], utc=True)
 
-print("Backfilling older data...")
+    out = out.merge(existing, on=['time', 'device_id'], how='left', indicator=True)
+    out = out[out['_merge'] == 'left_only'].drop(columns=['_merge'])
 
-features_df.to_sql(
-    "pratishtha_features",
-    db_utils.get_engine(),
-    if_exists='append',
-    index=False
-)
+# =========================
+# SAVE
+# =========================
+if not out.empty:
+    inserted = db_utils.save_dataframe(out, "pratishtha_features")
+    print(f"Inserted {inserted} rows")
+else:
+    print("No rows to insert")
 
-print("Backfill completed without touching existing rows!")
+print("Backfill complete")
